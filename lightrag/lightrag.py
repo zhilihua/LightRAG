@@ -1,17 +1,41 @@
+import configparser
+import warnings
 from dataclasses import asdict, dataclass, field
 from typing import Any, AsyncIterator, Callable, Iterator, cast, final, Literal
 from datetime import datetime
 import os
 import csv
 
-from lightrag.base import StoragesStatus
+from dotenv import load_dotenv
+
+from lightrag.base import (
+    StoragesStatus,
+    BaseKVStorage,
+    BaseVectorStorage,
+    BaseGraphStorage
+)
+
+from lightrag.kg import verify_storage_implementation, STORAGES
 from lightrag.operate import chunking_by_token_size
 from lightrag.prompt import PROMPTS
 from lightrag.utils import (
     EmbeddingFunc,
-    convert_response_to_json
+    convert_response_to_json,
+    logger,
+    check_storage_env_vars,
+    limit_async_func_call,
+    lazy_external_import
 )
 
+# use the .env that is inside the current folder
+# allows to use different .env file for each lightrag instance
+# the OS environment variables take precedence over the .env file
+# 使用当前文件夹内的 .env 允许为每个 lightrag 实例使用不同的 .env 文件，操作系统环境变量优先于 .env 文件
+load_dotenv(dotenv_path=".env", override=False)
+
+# TODO: TO REMOVE @Yannick
+config = configparser.ConfigParser()
+config.read("config.ini", "utf-8")
 
 @final
 @dataclass
@@ -222,3 +246,91 @@ class LightRAG:
     )
 
     _storages_status: StoragesStatus = field(default=StoragesStatus.NOT_CREATED)
+
+    # `__post_init__` 是在使用 Python 的 `dataclasses` 模块创建数据类时，可以定义的一个特殊方法。
+    # 这个方法在数据类实例初始化后被调用，用于执行一些额外的初始化逻辑。
+    def __post_init__(self):
+        from lightrag.kg.shared_storage import (
+            initialize_share_data,
+        )
+
+        # Handle deprecated parameters(处理已弃用的参数)
+        if self.log_level is not None:
+            warnings.warn(
+                "WARNING: log_level parameter is deprecated, use setup_logger in utils.py instead",
+                UserWarning,
+                stacklevel=2,
+            )
+        if self.log_file_path is not None:
+            warnings.warn(
+                "WARNING: log_file_path parameter is deprecated, use setup_logger in utils.py instead",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # Remove these attributes to prevent their use
+        if hasattr(self, "log_level"):
+            delattr(self, "log_level")
+        if hasattr(self, "log_file_path"):
+            delattr(self, "log_file_path")
+
+        initialize_share_data()
+
+        if not os.path.exists(self.working_dir):
+            logger.info(f"Creating working directory {self.working_dir}")
+            os.makedirs(self.working_dir)
+
+        # Verify storage implementation compatibility and environment variables(验证存储实现兼容性和环境变量)
+        storage_configs = [
+            ("KV_STORAGE", self.kv_storage),
+            ("VECTOR_STORAGE", self.vector_storage),
+            ("GRAPH_STORAGE", self.graph_storage),
+            ("DOC_STATUS_STORAGE", self.doc_status_storage),
+        ]
+
+        for storage_type, storage_name in storage_configs:
+            # Verify storage implementation compatibility(验证存储实现兼容性)
+            verify_storage_implementation(storage_type, storage_name)
+            # Check environment variables(检查环境变量)
+            check_storage_env_vars(storage_name)
+
+        # Ensure vector_db_storage_cls_kwargs has required fields(确保 vector_db_storage_cls_kwargs 具有必填字段)
+        self.vector_db_storage_cls_kwargs = {
+            "cosine_better_than_threshold": self.cosine_better_than_threshold,
+            **self.vector_db_storage_cls_kwargs,
+        }
+
+        # Show config
+        global_config = asdict(self)
+        _print_config = ",\n  ".join([f"{k} = {v}" for k, v in global_config.items()])
+        logger.debug(f"LightRAG init with param:\n  {_print_config}\n")
+
+        # Init LLM
+        self.embedding_func = limit_async_func_call(self.embedding_func_max_async)(  # type: ignore
+            self.embedding_func
+        )
+
+        # Initialize all storages(初始化所有存储)
+        self.key_string_value_json_storage_cls: type[BaseKVStorage] = (
+            self._get_storage_class(self.kv_storage)
+        )  # type: ignore
+        self.vector_db_storage_cls: type[BaseVectorStorage] = self._get_storage_class(
+            self.vector_storage
+        )  # type: ignore
+        self.graph_storage_cls: type[BaseGraphStorage] = self._get_storage_class(
+            self.graph_storage
+        )  # type: ignore
+        self.key_string_value_json_storage_cls = partial(  # type: ignore
+            self.key_string_value_json_storage_cls, global_config=global_config
+        )
+        self.vector_db_storage_cls = partial(  # type: ignore
+            self.vector_db_storage_cls, global_config=global_config
+        )
+        self.graph_storage_cls = partial(  # type: ignore
+            self.graph_storage_cls, global_config=global_config
+        )
+
+    def _get_storage_class(self, storage_name: str) -> Callable[..., Any]:
+        import_path = STORAGES[storage_name]
+        storage_class = lazy_external_import(import_path, storage_name)
+        return storage_class

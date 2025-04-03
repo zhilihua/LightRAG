@@ -1,6 +1,11 @@
 import logging
 import os
 from lightrag.lightrag import LightRAG
+from lightrag.llm.ollama_local import (
+    ollama_model_complete,
+    ollama_embed
+)
+from lightrag.utils import EmbeddingFunc
 
 WORKING_DIR = "./dickens"
 
