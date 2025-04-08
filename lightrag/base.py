@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import (
+    Any,
+    Callable,
+    Literal,
+    TypedDict
+)
 
 import numpy as np
 
@@ -167,3 +173,118 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         self, node_label: str, max_depth: int = 3
     ) -> KnowledgeGraph:
         """Retrieve a subgraph of the knowledge graph starting from a given node."""
+
+class DocStatus(str, Enum):
+    """Document processing status"""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    PROCESSED = "processed"
+    FAILED = "failed"
+
+@dataclass
+class DocProcessingStatus:
+    """Document processing status data structure"""
+
+    content: str
+    """Original content of the document"""
+    content_summary: str
+    """First 100 chars of document content, used for preview"""
+    content_length: int
+    """Total length of document"""
+    file_path: str
+    """File path of the document"""
+    status: DocStatus
+    """Current processing status"""
+    created_at: str
+    """ISO format timestamp when document was created"""
+    updated_at: str
+    """ISO format timestamp when document was last updated"""
+    chunks_count: int | None = None
+    """Number of chunks after splitting, used for processing"""
+    error: str | None = None
+    """Error message if failed"""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """Additional metadata"""
+
+@dataclass
+class DocStatusStorage(BaseKVStorage, ABC):
+    """Base class for document status storage"""
+
+    @abstractmethod
+    async def get_status_counts(self) -> dict[str, int]:
+        """Get counts of documents in each status"""
+
+    @abstractmethod
+    async def get_docs_by_status(
+        self, status: DocStatus
+    ) -> dict[str, DocProcessingStatus]:
+        """Get all documents with a specific status"""
+
+@dataclass
+class QueryParam:
+    """Configuration parameters for query execution in LightRAG."""
+
+    mode: Literal["local", "global", "hybrid", "naive", "mix"] = "global"
+    """Specifies the retrieval mode:
+    - "local": Focuses on context-dependent information.
+    - "global": Utilizes global knowledge.
+    - "hybrid": Combines local and global retrieval methods.
+    - "naive": Performs a basic search without advanced techniques.
+    - "mix": Integrates knowledge graph and vector retrieval.
+    """
+
+    only_need_context: bool = False
+    """If True, only returns the retrieved context without generating a response."""
+
+    only_need_prompt: bool = False
+    """If True, only returns the generated prompt without producing a response."""
+
+    response_type: str = "Multiple Paragraphs"
+    """Defines the response format. Examples: 'Multiple Paragraphs', 'Single Paragraph', 'Bullet Points'."""
+
+    stream: bool = False
+    """If True, enables streaming output for real-time responses."""
+
+    top_k: int = int(os.getenv("TOP_K", "60"))
+    """Number of top items to retrieve. Represents entities in 'local' mode and relationships in 'global' mode."""
+
+    max_token_for_text_unit: int = int(os.getenv("MAX_TOKEN_TEXT_CHUNK", "4000"))
+    """Maximum number of tokens allowed for each retrieved text chunk."""
+
+    max_token_for_global_context: int = int(
+        os.getenv("MAX_TOKEN_RELATION_DESC", "4000")
+    )
+    """Maximum number of tokens allocated for relationship descriptions in global retrieval."""
+
+    max_token_for_local_context: int = int(os.getenv("MAX_TOKEN_ENTITY_DESC", "4000"))
+    """Maximum number of tokens allocated for entity descriptions in local retrieval."""
+
+    hl_keywords: list[str] = field(default_factory=list)
+    """List of high-level keywords to prioritize in retrieval."""
+
+    ll_keywords: list[str] = field(default_factory=list)
+    """List of low-level keywords to refine retrieval focus."""
+
+    conversation_history: list[dict[str, str]] = field(default_factory=list)
+    """Stores past conversation history to maintain context.
+    Format: [{"role": "user/assistant", "content": "message"}].
+    """
+
+    history_turns: int = 3
+    """Number of complete conversation turns (user-assistant pairs) to consider in the response context."""
+
+    ids: list[str] | None = None
+    """List of ids to filter the results."""
+
+    model_func: Callable[..., object] | None = None
+    """Optional override for the LLM model function to use for this specific query.
+    If provided, this will be used instead of the global model function.
+    This allows using different models for different query modes.
+    """
+
+class TextChunkSchema(TypedDict):
+    tokens: int
+    content: str
+    full_doc_id: str
+    chunk_order_index: int

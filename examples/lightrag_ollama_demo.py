@@ -1,5 +1,10 @@
+import asyncio
+import inspect
 import logging
 import os
+
+from lightrag.base import QueryParam
+from lightrag.kg.shared_storage import initialize_pipeline_status
 from lightrag.lightrag import LightRAG
 from lightrag.llm.ollama_local import (
     ollama_model_complete,
@@ -38,3 +43,59 @@ async def initialize_rag():
     await initialize_pipeline_status()
 
     return rag
+
+async def print_stream(stream):
+    async for chunk in stream:
+        print(chunk, end="", flush=True)
+
+def main():
+    # Initialize RAG instance
+    rag = asyncio.run(initialize_rag())
+
+    # Insert example text
+    with open("./book.txt", "r", encoding="utf-8") as f:
+        rag.insert(f.read())
+
+    # Test different query modes
+    print("\nNaive Search:")
+    print(
+        rag.query(
+            "What are the top themes in this story?", param=QueryParam(mode="naive")
+        )
+    )
+
+    print("\nLocal Search:")
+    print(
+        rag.query(
+            "What are the top themes in this story?", param=QueryParam(mode="local")
+        )
+    )
+
+    print("\nGlobal Search:")
+    print(
+        rag.query(
+            "What are the top themes in this story?", param=QueryParam(mode="global")
+        )
+    )
+
+    print("\nHybrid Search:")
+    print(
+        rag.query(
+            "What are the top themes in this story?", param=QueryParam(mode="hybrid")
+        )
+    )
+
+    # stream response
+    resp = rag.query(
+        "What are the top themes in this story?",
+        param=QueryParam(mode="hybrid", stream=True),
+    )
+
+    if inspect.isasyncgen(resp):
+        asyncio.run(print_stream(resp))
+    else:
+        print(resp)
+
+
+if __name__ == "__main__":
+    main()
