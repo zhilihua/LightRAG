@@ -23,7 +23,7 @@ from lightrag.base import (
 
 from lightrag.kg import verify_storage_implementation, STORAGES
 from lightrag.namespace import NameSpace, make_namespace
-from lightrag.operate import chunking_by_token_size, extract_entities, kg_query
+from lightrag.operate import chunking_by_token_size, extract_entities, kg_query, naive_query, mix_kg_vector_query
 from lightrag.prompt import PROMPTS
 from lightrag.utils import (
     EmbeddingFunc,
@@ -1067,3 +1067,6 @@ class LightRAG:
             raise ValueError(f"Unknown mode {param.mode}")
         await self._query_done()
         return response
+
+    async def _query_done(self):
+        await self.llm_response_cache.index_done_callback()

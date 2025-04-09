@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import traceback
 from collections import defaultdict, Counter
 from typing import Any, AsyncIterator
 
@@ -27,7 +28,10 @@ from lightrag.utils import (
     is_float_regex,
     pack_user_ass_to_openai_messages,
     compute_mdhash_id,
-    get_conversation_turns
+    get_conversation_turns,
+    process_combine_contexts,
+    truncate_list_by_token_size,
+    list_of_list_to_csv
 )
 
 
@@ -1247,3 +1251,592 @@ async def _get_edge_data(
         text_units_section_list.append([i, t["content"], t.get("file_path", "unknown")])
     text_units_context = list_of_list_to_csv(text_units_section_list)
     return entities_context, relations_context, text_units_context
+
+def combine_contexts(entities, relationships, sources):
+    # Function to extract entities, relationships, and sources from context strings
+    hl_entities, ll_entities = entities[0], entities[1]
+    hl_relationships, ll_relationships = relationships[0], relationships[1]
+    hl_sources, ll_sources = sources[0], sources[1]
+    # Combine and deduplicate the entities
+    combined_entities = process_combine_contexts(hl_entities, ll_entities)
+
+    # Combine and deduplicate the relationships
+    combined_relationships = process_combine_contexts(
+        hl_relationships, ll_relationships
+    )
+
+    # Combine and deduplicate the sources
+    combined_sources = process_combine_contexts(hl_sources, ll_sources)
+
+    return combined_entities, combined_relationships, combined_sources
+
+async def _find_most_related_text_unit_from_entities(
+    node_datas: list[dict],
+    query_param: QueryParam,
+    text_chunks_db: BaseKVStorage,
+    knowledge_graph_inst: BaseGraphStorage,
+):
+    text_units = [
+        split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
+        for dp in node_datas
+    ]
+    edges = await asyncio.gather(
+        *[knowledge_graph_inst.get_node_edges(dp["entity_name"]) for dp in node_datas]
+    )
+    all_one_hop_nodes = set()
+    for this_edges in edges:
+        if not this_edges:
+            continue
+        all_one_hop_nodes.update([e[1] for e in this_edges])
+
+    all_one_hop_nodes = list(all_one_hop_nodes)
+    all_one_hop_nodes_data = await asyncio.gather(
+        *[knowledge_graph_inst.get_node(e) for e in all_one_hop_nodes]
+    )
+
+    # Add null check for node data
+    all_one_hop_text_units_lookup = {
+        k: set(split_string_by_multi_markers(v["source_id"], [GRAPH_FIELD_SEP]))
+        for k, v in zip(all_one_hop_nodes, all_one_hop_nodes_data)
+        if v is not None and "source_id" in v  # Add source_id check
+    }
+
+    all_text_units_lookup = {}
+    tasks = []
+
+    for index, (this_text_units, this_edges) in enumerate(zip(text_units, edges)):
+        for c_id in this_text_units:
+            if c_id not in all_text_units_lookup:
+                all_text_units_lookup[c_id] = index
+                tasks.append((c_id, index, this_edges))
+
+    # Process in batches of 25 tasks at a time to avoid overwhelming resources
+    batch_size = 5
+    results = []
+
+    for i in range(0, len(tasks), batch_size):
+        batch_tasks = tasks[i : i + batch_size]
+        batch_results = await asyncio.gather(
+            *[text_chunks_db.get_by_id(c_id) for c_id, _, _ in batch_tasks]
+        )
+        results.extend(batch_results)
+
+    for (c_id, index, this_edges), data in zip(tasks, results):
+        all_text_units_lookup[c_id] = {
+            "data": data,
+            "order": index,
+            "relation_counts": 0,
+        }
+
+        if this_edges:
+            for e in this_edges:
+                if (
+                    e[1] in all_one_hop_text_units_lookup
+                    and c_id in all_one_hop_text_units_lookup[e[1]]
+                ):
+                    all_text_units_lookup[c_id]["relation_counts"] += 1
+
+    # Filter out None values and ensure data has content
+    all_text_units = [
+        {"id": k, **v}
+        for k, v in all_text_units_lookup.items()
+        if v is not None and v.get("data") is not None and "content" in v["data"]
+    ]
+
+    if not all_text_units:
+        logger.warning("No valid text units found")
+        return []
+
+    all_text_units = sorted(
+        all_text_units, key=lambda x: (x["order"], -x["relation_counts"])
+    )
+
+    all_text_units = truncate_list_by_token_size(
+        all_text_units,
+        key=lambda x: x["data"]["content"],
+        max_token_size=query_param.max_token_for_text_unit,
+    )
+
+    logger.debug(
+        f"Truncate chunks from {len(all_text_units_lookup)} to {len(all_text_units)} (max tokens:{query_param.max_token_for_text_unit})"
+    )
+
+    all_text_units = [t["data"] for t in all_text_units]
+    return all_text_units
+
+async def _find_most_related_edges_from_entities(
+    node_datas: list[dict],
+    query_param: QueryParam,
+    knowledge_graph_inst: BaseGraphStorage,
+):
+    all_related_edges = await asyncio.gather(
+        *[knowledge_graph_inst.get_node_edges(dp["entity_name"]) for dp in node_datas]
+    )
+    all_edges = []
+    seen = set()
+
+    for this_edges in all_related_edges:
+        for e in this_edges:
+            sorted_edge = tuple(sorted(e))
+            if sorted_edge not in seen:
+                seen.add(sorted_edge)
+                all_edges.append(sorted_edge)
+
+    all_edges_pack, all_edges_degree = await asyncio.gather(
+        asyncio.gather(*[knowledge_graph_inst.get_edge(e[0], e[1]) for e in all_edges]),
+        asyncio.gather(
+            *[knowledge_graph_inst.edge_degree(e[0], e[1]) for e in all_edges]
+        ),
+    )
+    all_edges_data = [
+        {"src_tgt": k, "rank": d, **v}
+        for k, v, d in zip(all_edges, all_edges_pack, all_edges_degree)
+        if v is not None
+    ]
+    all_edges_data = sorted(
+        all_edges_data, key=lambda x: (x["rank"], x["weight"]), reverse=True
+    )
+    all_edges_data = truncate_list_by_token_size(
+        all_edges_data,
+        key=lambda x: x["description"] if x["description"] is not None else "",
+        max_token_size=query_param.max_token_for_global_context,
+    )
+
+    logger.debug(
+        f"Truncate relations from {len(all_edges)} to {len(all_edges_data)} (max tokens:{query_param.max_token_for_global_context})"
+    )
+
+    return all_edges_data
+
+async def _find_most_related_entities_from_relationships(
+    edge_datas: list[dict],
+    query_param: QueryParam,
+    knowledge_graph_inst: BaseGraphStorage,
+):
+    entity_names = []
+    seen = set()
+
+    for e in edge_datas:
+        if e["src_id"] not in seen:
+            entity_names.append(e["src_id"])
+            seen.add(e["src_id"])
+        if e["tgt_id"] not in seen:
+            entity_names.append(e["tgt_id"])
+            seen.add(e["tgt_id"])
+
+    node_datas, node_degrees = await asyncio.gather(
+        asyncio.gather(
+            *[
+                knowledge_graph_inst.get_node(entity_name)
+                for entity_name in entity_names
+            ]
+        ),
+        asyncio.gather(
+            *[
+                knowledge_graph_inst.node_degree(entity_name)
+                for entity_name in entity_names
+            ]
+        ),
+    )
+    node_datas = [
+        {**n, "entity_name": k, "rank": d}
+        for k, n, d in zip(entity_names, node_datas, node_degrees)
+    ]
+
+    len_node_datas = len(node_datas)
+    node_datas = truncate_list_by_token_size(
+        node_datas,
+        key=lambda x: x["description"] if x["description"] is not None else "",
+        max_token_size=query_param.max_token_for_local_context,
+    )
+    logger.debug(
+        f"Truncate entities from {len_node_datas} to {len(node_datas)} (max tokens:{query_param.max_token_for_local_context})"
+    )
+
+    return node_datas
+
+async def _find_related_text_unit_from_relationships(
+    edge_datas: list[dict],
+    query_param: QueryParam,
+    text_chunks_db: BaseKVStorage,
+    knowledge_graph_inst: BaseGraphStorage,
+):
+    text_units = [
+        split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
+        for dp in edge_datas
+    ]
+    all_text_units_lookup = {}
+
+    async def fetch_chunk_data(c_id, index):
+        if c_id not in all_text_units_lookup:
+            chunk_data = await text_chunks_db.get_by_id(c_id)
+            # Only store valid data
+            if chunk_data is not None and "content" in chunk_data:
+                all_text_units_lookup[c_id] = {
+                    "data": chunk_data,
+                    "order": index,
+                }
+
+    tasks = []
+    for index, unit_list in enumerate(text_units):
+        for c_id in unit_list:
+            tasks.append(fetch_chunk_data(c_id, index))
+
+    await asyncio.gather(*tasks)
+
+    if not all_text_units_lookup:
+        logger.warning("No valid text chunks found")
+        return []
+
+    all_text_units = [{"id": k, **v} for k, v in all_text_units_lookup.items()]
+    all_text_units = sorted(all_text_units, key=lambda x: x["order"])
+
+    # Ensure all text chunks have content
+    valid_text_units = [
+        t for t in all_text_units if t["data"] is not None and "content" in t["data"]
+    ]
+
+    if not valid_text_units:
+        logger.warning("No valid text chunks after filtering")
+        return []
+
+    truncated_text_units = truncate_list_by_token_size(
+        valid_text_units,
+        key=lambda x: x["data"]["content"],
+        max_token_size=query_param.max_token_for_text_unit,
+    )
+
+    logger.debug(
+        f"Truncate chunks from {len(valid_text_units)} to {len(truncated_text_units)} (max tokens:{query_param.max_token_for_text_unit})"
+    )
+
+    all_text_units: list[TextChunkSchema] = [t["data"] for t in truncated_text_units]
+
+    return all_text_units
+
+async def naive_query(
+    query: str,
+    chunks_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    global_config: dict[str, str],
+    hashing_kv: BaseKVStorage | None = None,
+    system_prompt: str | None = None,
+) -> str | AsyncIterator[str]:
+    # Handle cache
+    use_model_func = (
+        query_param.model_func
+        if query_param.model_func
+        else global_config["llm_model_func"]
+    )
+    args_hash = compute_args_hash(query_param.mode, query, cache_type="query")
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, query, query_param.mode, cache_type="query"
+    )
+    if cached_response is not None:
+        return cached_response
+
+    results = await chunks_vdb.query(
+        query, top_k=query_param.top_k, ids=query_param.ids
+    )
+    if not len(results):
+        return PROMPTS["fail_response"]
+
+    chunks_ids = [r["id"] for r in results]
+    chunks = await text_chunks_db.get_by_ids(chunks_ids)
+
+    # Filter out invalid chunks
+    valid_chunks = [
+        chunk for chunk in chunks if chunk is not None and "content" in chunk
+    ]
+
+    if not valid_chunks:
+        logger.warning("No valid chunks found after filtering")
+        return PROMPTS["fail_response"]
+
+    maybe_trun_chunks = truncate_list_by_token_size(
+        valid_chunks,
+        key=lambda x: x["content"],
+        max_token_size=query_param.max_token_for_text_unit,
+    )
+
+    if not maybe_trun_chunks:
+        logger.warning("No chunks left after truncation")
+        return PROMPTS["fail_response"]
+
+    logger.debug(
+        f"Truncate chunks from {len(chunks)} to {len(maybe_trun_chunks)} (max tokens:{query_param.max_token_for_text_unit})"
+    )
+
+    section = "\n--New Chunk--\n".join(
+        [
+            "File path: " + c["file_path"] + "\n" + c["content"]
+            for c in maybe_trun_chunks
+        ]
+    )
+
+    if query_param.only_need_context:
+        return section
+
+    # Process conversation history
+    history_context = ""
+    if query_param.conversation_history:
+        history_context = get_conversation_turns(
+            query_param.conversation_history, query_param.history_turns
+        )
+
+    sys_prompt_temp = system_prompt if system_prompt else PROMPTS["naive_rag_response"]
+    sys_prompt = sys_prompt_temp.format(
+        content_data=section,
+        response_type=query_param.response_type,
+        history=history_context,
+    )
+
+    if query_param.only_need_prompt:
+        return sys_prompt
+
+    len_of_prompts = len(encode_string_by_tiktoken(query + sys_prompt))
+    logger.debug(f"[naive_query]Prompt Tokens: {len_of_prompts}")
+
+    response = await use_model_func(
+        query,
+        system_prompt=sys_prompt,
+    )
+
+    if len(response) > len(sys_prompt):
+        response = (
+            response[len(sys_prompt) :]
+            .replace(sys_prompt, "")
+            .replace("user", "")
+            .replace("model", "")
+            .replace(query, "")
+            .replace("<system>", "")
+            .replace("</system>", "")
+            .strip()
+        )
+
+    # Save to cache
+    await save_to_cache(
+        hashing_kv,
+        CacheData(
+            args_hash=args_hash,
+            content=response,
+            prompt=query,
+            quantized=quantized,
+            min_val=min_val,
+            max_val=max_val,
+            mode=query_param.mode,
+            cache_type="query",
+        ),
+    )
+
+    return response
+
+async def mix_kg_vector_query(
+    query: str,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    chunks_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    global_config: dict[str, str],
+    hashing_kv: BaseKVStorage | None = None,
+    system_prompt: str | None = None,
+) -> str | AsyncIterator[str]:
+    """
+    Hybrid retrieval implementation combining knowledge graph and vector search.
+
+    This function performs a hybrid search by:
+    1. Extracting semantic information from knowledge graph
+    2. Retrieving relevant text chunks through vector similarity
+    3. Combining both results for comprehensive answer generation
+    """
+    # 1. Cache handling
+    use_model_func = (
+        query_param.model_func
+        if query_param.model_func
+        else global_config["llm_model_func"]
+    )
+    args_hash = compute_args_hash("mix", query, cache_type="query")
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, query, "mix", cache_type="query"
+    )
+    if cached_response is not None:
+        return cached_response
+
+    # Process conversation history
+    history_context = ""
+    if query_param.conversation_history:
+        history_context = get_conversation_turns(
+            query_param.conversation_history, query_param.history_turns
+        )
+
+    # 2. Execute knowledge graph and vector searches in parallel
+    async def get_kg_context():
+        try:
+            hl_keywords, ll_keywords = await get_keywords_from_query(
+                query, query_param, global_config, hashing_kv
+            )
+
+            if not hl_keywords and not ll_keywords:
+                logger.warning("Both high-level and low-level keywords are empty")
+                return None
+
+            # Convert keyword lists to strings
+            ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
+            hl_keywords_str = ", ".join(hl_keywords) if hl_keywords else ""
+
+            # Set query mode based on available keywords
+            if not ll_keywords_str and not hl_keywords_str:
+                return None
+            elif not ll_keywords_str:
+                query_param.mode = "global"
+            elif not hl_keywords_str:
+                query_param.mode = "local"
+            else:
+                query_param.mode = "hybrid"
+
+            # Build knowledge graph context
+            context = await _build_query_context(
+                ll_keywords_str,
+                hl_keywords_str,
+                knowledge_graph_inst,
+                entities_vdb,
+                relationships_vdb,
+                text_chunks_db,
+                query_param,
+            )
+
+            return context
+
+        except Exception as e:
+            logger.error(f"Error in get_kg_context: {str(e)}")
+            traceback.print_exc()
+            return None
+
+    async def get_vector_context():
+        # Consider conversation history in vector search
+        augmented_query = query
+        if history_context:
+            augmented_query = f"{history_context}\n{query}"
+
+        try:
+            # Reduce top_k for vector search in hybrid mode since we have structured information from KG
+            mix_topk = min(10, query_param.top_k)
+            results = await chunks_vdb.query(
+                augmented_query, top_k=mix_topk, ids=query_param.ids
+            )
+            if not results:
+                return None
+
+            chunks_ids = [r["id"] for r in results]
+            chunks = await text_chunks_db.get_by_ids(chunks_ids)
+
+            valid_chunks = []
+            for chunk, result in zip(chunks, results):
+                if chunk is not None and "content" in chunk:
+                    # Merge chunk content and time metadata
+                    chunk_with_time = {
+                        "content": chunk["content"],
+                        "created_at": result.get("created_at", None),
+                    }
+                    valid_chunks.append(chunk_with_time)
+
+            if not valid_chunks:
+                return None
+
+            maybe_trun_chunks = truncate_list_by_token_size(
+                valid_chunks,
+                key=lambda x: x["content"],
+                max_token_size=query_param.max_token_for_text_unit,
+            )
+
+            if not maybe_trun_chunks:
+                return None
+
+            # Include time information in content
+            formatted_chunks = []
+            for c in maybe_trun_chunks:
+                chunk_text = "File path: " + c["file_path"] + "\n" + c["content"]
+                if c["created_at"]:
+                    chunk_text = f"[Created at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(c['created_at']))}]\n{chunk_text}"
+                formatted_chunks.append(chunk_text)
+
+            logger.debug(
+                f"Truncate chunks from {len(chunks)} to {len(formatted_chunks)} (max tokens:{query_param.max_token_for_text_unit})"
+            )
+            return "\n--New Chunk--\n".join(formatted_chunks)
+        except Exception as e:
+            logger.error(f"Error in get_vector_context: {e}")
+            return None
+
+    # 3. Execute both retrievals in parallel
+    kg_context, vector_context = await asyncio.gather(
+        get_kg_context(), get_vector_context()
+    )
+
+    # 4. Merge contexts
+    if kg_context is None and vector_context is None:
+        return PROMPTS["fail_response"]
+
+    if query_param.only_need_context:
+        return {"kg_context": kg_context, "vector_context": vector_context}
+
+    # 5. Construct hybrid prompt
+    sys_prompt = (
+        system_prompt
+        if system_prompt
+        else PROMPTS["mix_rag_response"].format(
+            kg_context=kg_context
+            if kg_context
+            else "No relevant knowledge graph information found",
+            vector_context=vector_context
+            if vector_context
+            else "No relevant text information found",
+            response_type=query_param.response_type,
+            history=history_context,
+        )
+    )
+
+    if query_param.only_need_prompt:
+        return sys_prompt
+
+    len_of_prompts = len(encode_string_by_tiktoken(query + sys_prompt))
+    logger.debug(f"[mix_kg_vector_query]Prompt Tokens: {len_of_prompts}")
+
+    # 6. Generate response
+    response = await use_model_func(
+        query,
+        system_prompt=sys_prompt,
+        stream=query_param.stream,
+    )
+
+    # Clean up response content
+    if isinstance(response, str) and len(response) > len(sys_prompt):
+        response = (
+            response.replace(sys_prompt, "")
+            .replace("user", "")
+            .replace("model", "")
+            .replace(query, "")
+            .replace("<system>", "")
+            .replace("</system>", "")
+            .strip()
+        )
+
+        # 7. Save cache - Only cache after collecting complete response
+        await save_to_cache(
+            hashing_kv,
+            CacheData(
+                args_hash=args_hash,
+                content=response,
+                prompt=query,
+                quantized=quantized,
+                min_val=min_val,
+                max_val=max_val,
+                mode="mix",
+                cache_type="query",
+            ),
+        )
+
+    return response

@@ -1,5 +1,7 @@
 import asyncio
+import csv
 import html
+import io
 import json
 import logging
 import os
@@ -588,3 +590,83 @@ def get_conversation_turns(
         )
 
     return "\n".join(formatted_turns)
+
+def process_combine_contexts(hl: str, ll: str):
+    header = None
+    list_hl = csv_string_to_list(hl.strip())
+    list_ll = csv_string_to_list(ll.strip())
+
+    if list_hl:
+        header = list_hl[0]
+        list_hl = list_hl[1:]
+    if list_ll:
+        header = list_ll[0]
+        list_ll = list_ll[1:]
+    if header is None:
+        return ""
+
+    if list_hl:
+        list_hl = [",".join(item[1:]) for item in list_hl if item]
+    if list_ll:
+        list_ll = [",".join(item[1:]) for item in list_ll if item]
+
+    combined_sources = []
+    seen = set()
+
+    for item in list_hl + list_ll:
+        if item and item not in seen:
+            combined_sources.append(item)
+            seen.add(item)
+
+    combined_sources_result = [",\t".join(header)]
+
+    for i, item in enumerate(combined_sources, start=1):
+        combined_sources_result.append(f"{i},\t{item}")
+
+    combined_sources_result = "\n".join(combined_sources_result)
+
+    return combined_sources_result
+
+def csv_string_to_list(csv_string: str) -> list[list[str]]:
+    # Clean the string by removing NUL characters
+    cleaned_string = csv_string.replace("\0", "")
+
+    output = io.StringIO(cleaned_string)
+    reader = csv.reader(
+        output,
+        quoting=csv.QUOTE_ALL,  # Match the writer configuration
+        escapechar="\\",  # Use backslash as escape character
+        quotechar='"',  # Use double quotes
+    )
+
+    try:
+        return [row for row in reader]
+    except csv.Error as e:
+        raise ValueError(f"Failed to parse CSV string: {str(e)}")
+    finally:
+        output.close()
+
+def truncate_list_by_token_size(
+    list_data: list[Any], key: Callable[[Any], str], max_token_size: int
+) -> list[int]:
+    """Truncate a list of data by token size"""
+    if max_token_size <= 0:
+        return []
+    tokens = 0
+    for i, data in enumerate(list_data):
+        tokens += len(encode_string_by_tiktoken(key(data)))
+        if tokens > max_token_size:
+            return list_data[:i]
+    return list_data
+
+def list_of_list_to_csv(data: list[list[str]]) -> str:
+    output = io.StringIO()
+    writer = csv.writer(
+        output,
+        quoting=csv.QUOTE_ALL,  # Quote all fields
+        escapechar="\\",  # Use backslash as escape character
+        quotechar='"',  # Use double quotes
+        lineterminator="\n",  # Explicit line terminator
+    )
+    writer.writerows(data)
+    return output.getvalue()
