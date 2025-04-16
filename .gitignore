@@ -58,7 +58,7 @@ ignore_this.txt
 
 # Project-specific files
 dickens*/
-book.txt
+# book.txt
 lightrag-dev/
 gui/
 
