@@ -36,7 +36,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
             raise ValueError(
                 "cosine_better_than_threshold must be specified in vector_db_storage_cls_kwargs"
             )
-        self.cosine_better_than_threshold = cosine_threshold
+        self.cosine_better_than_threshold = cosine_threshold  # 余弦阈值
 
         self._client_file_name = os.path.join(
             self.global_config["working_dir"], f"vdb_{self.namespace}.json"

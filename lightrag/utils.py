@@ -28,6 +28,47 @@ logger.setLevel(logging.INFO)
 
 # Set httpx logging level to WARNING
 logging.getLogger("httpx").setLevel(logging.WARNING)
+VERBOSE_DEBUG = os.getenv("VERBOSE", "false").lower() == "true"
+
+def verbose_debug(msg: str, *args, **kwargs):
+    """Function for outputting detailed debug information.
+    When VERBOSE_DEBUG=True, outputs the complete message.
+    When VERBOSE_DEBUG=False, outputs only the first 50 characters.
+
+    Args:
+        msg: The message format string
+        *args: Arguments to be formatted into the message
+        **kwargs: Keyword arguments passed to logger.debug()
+    """
+    if VERBOSE_DEBUG:
+        logger.debug(msg, *args, **kwargs)
+    else:
+        # Format the message with args first
+        if args:
+            formatted_msg = msg % args
+        else:
+            formatted_msg = msg
+        # Then truncate the formatted message
+        truncated_msg = (
+            formatted_msg[:100] + "..." if len(formatted_msg) > 100 else formatted_msg
+        )
+        logger.debug(truncated_msg, **kwargs)
+
+def safe_unicode_decode(content):
+    # Regular expression to find all Unicode escape sequences of the form \uXXXX
+    unicode_escape_pattern = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+    # Function to replace the Unicode escape with the actual character
+    def replace_unicode_escape(match):
+        # Convert the matched hexadecimal value into the actual Unicode character
+        return chr(int(match.group(1), 16))
+
+    # Perform the substitution
+    decoded_content = unicode_escape_pattern.sub(
+        replace_unicode_escape, content.decode("utf-8")
+    )
+
+    return decoded_content
 
 @dataclass
 class EmbeddingFunc:

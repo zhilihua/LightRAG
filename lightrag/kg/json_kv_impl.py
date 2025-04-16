@@ -30,11 +30,11 @@ class JsonKVStorage(BaseKVStorage):
     async def initialize(self):
         """Initialize storage data(初始化存储数据)"""
         self._storage_lock = get_storage_lock()
-        self.storage_updated = await get_update_flag(self.namespace)
+        self.storage_updated = await get_update_flag(self.namespace)  # 会在共享数据中添加字典项记录是否需要更新（shared_storage）_update_flags 默认为false
         async with get_data_init_lock():
             # check need_init must before get_namespace_data
-            need_init = await try_initialize_namespace(self.namespace)
-            self._data = await get_namespace_data(self.namespace)
+            need_init = await try_initialize_namespace(self.namespace) # 是否需要初始化，如果未初始化，则进行初始化
+            self._data = await get_namespace_data(self.namespace)  # 获取该命名空间下的数据，第一次为{}
             if need_init:
                 loaded_data = load_json(self._file_name) or {}
                 async with self._storage_lock:
