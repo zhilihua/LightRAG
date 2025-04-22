@@ -31,7 +31,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
 
         # Use global config value if specified, otherwise use default
         kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
-        cosine_threshold = kwargs.get("cosine_better_than_threshold")
+        cosine_threshold = kwargs.get("cosine_better_than_threshold")   # 默认0.2
         if cosine_threshold is None:
             raise ValueError(
                 "cosine_better_than_threshold must be specified in vector_db_storage_cls_kwargs"

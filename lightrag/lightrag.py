@@ -322,18 +322,18 @@ class LightRAG:
         )
 
         # Initialize all storages(初始化所有存储)
-        self.key_string_value_json_storage_cls: type[BaseKVStorage] = (
-            self._get_storage_class(self.kv_storage)
+        self.key_string_value_json_storage_cls = self._get_storage_class(
+            self.kv_storage
         )  # type: ignore
-        self.vector_db_storage_cls: type[BaseVectorStorage] = self._get_storage_class(
+        self.vector_db_storage_cls = self._get_storage_class(
             self.vector_storage
         )  # type: ignore
-        self.graph_storage_cls: type[BaseGraphStorage] = self._get_storage_class(
+        self.graph_storage_cls = self._get_storage_class(
             self.graph_storage
         )  # type: ignore
         self.key_string_value_json_storage_cls = partial(  # type: ignore
             self.key_string_value_json_storage_cls, global_config=global_config
-        )
+        )   # 获取类
         self.vector_db_storage_cls = partial(  # type: ignore
             self.vector_db_storage_cls, global_config=global_config
         )
@@ -352,7 +352,7 @@ class LightRAG:
                 self
             ),  # Add global_config to ensure cache works properly
             embedding_func=self.embedding_func,
-        )
+        )  # 实例化类
 
         self.full_docs: BaseKVStorage = self.key_string_value_json_storage_cls(  # type: ignore
             namespace=make_namespace(
