@@ -10,11 +10,13 @@ from lightrag.llm.ollama_local import (
     ollama_model_complete,
     ollama_embed
 )
-from lightrag.utils import EmbeddingFunc
+from lightrag.utils import EmbeddingFunc, setup_logger
 
 WORKING_DIR = "./dickens"
 
 logging.basicConfig(format="%(levelname)s:%(message)s", level=logging.INFO)
+
+setup_logger("lightrag", level="DEBUG", log_file_path="../log/lightrag.log")
 
 if not os.path.exists(WORKING_DIR):
     os.mkdir(WORKING_DIR)
